@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from typing import Dict, List, Optional
 
@@ -49,6 +50,7 @@ STATE_DEFAULTS = {
     "scores": {},                    # Dict[str, Dict[str, float]]   (filename -> {key: score})
     "current_student": None,         # str — filename key
     "current_tab": 0,                # int — question tab
+    "reset_version": 0,              # int — bumped on student score reset, appended to widget keys
 }
 
 for key, val in STATE_DEFAULTS.items():
@@ -183,9 +185,6 @@ with st.sidebar:
         qs = st.session_state.reference_questions
         st.info(f"✅ 参考答案已加载 ({len(qs)} 大题)")
         ref_sig = st.session_state.reference_signature or ""
-        # Show short preview
-        for q in qs:
-            st.caption(f"  Q{q.index}: {q.title[:50]}…" if len(q.title) > 50 else f"  Q{q.index}: {q.title}")
     else:
         st.warning("请上传参考答案文档")
 
@@ -285,6 +284,7 @@ with st.sidebar:
         if st.button("🔄 重置当前学生分数", use_container_width=True):
             if current in st.session_state.scores:
                 st.session_state.scores[current] = {}
+                st.session_state.reset_version += 1
                 save_scores()
                 st.rerun()
 
@@ -397,10 +397,17 @@ def render_student_answer(
     tab_labels = [f"📌 第{'一二三四'[i]}题" for i in range(q_count)]
 
     def render_tab_bar(key_prefix: str):
-        """Render a row of question-selector buttons."""
-        cols = st.columns(q_count)
+        """Render a row of question-selector buttons with prev/next."""
+        cols = st.columns(q_count + 2)
+        # Previous button
+        with cols[0]:
+            if st.button("◀ 上一题", use_container_width=True, key=f"{key_prefix}_prev",
+                         disabled=(st.session_state.current_tab <= 0)):
+                st.session_state.current_tab -= 1
+                st.rerun()
+        # Question tabs
         for i in range(q_count):
-            with cols[i]:
+            with cols[i + 1]:
                 is_active = st.session_state.current_tab == i
                 if st.button(
                     tab_labels[i],
@@ -410,6 +417,12 @@ def render_student_answer(
                 ):
                     st.session_state.current_tab = i
                     st.rerun()
+        # Next button
+        with cols[q_count + 1]:
+            if st.button("下一题 ▶", use_container_width=True, key=f"{key_prefix}_next",
+                         disabled=(st.session_state.current_tab >= q_count - 1)):
+                st.session_state.current_tab += 1
+                st.rerun()
 
     # Top tab bar
     render_tab_bar("top")
@@ -422,7 +435,7 @@ def render_student_answer(
 
         # Major question title
         q_title = stu_q.title or f"第{q_idx+1}题"
-        st.subheader(f"**{q_title}**　(25分)")
+        st.subheader(f"**{q_title}**")
 
         # Render each sub-question
         for sub_idx in range(5):
@@ -475,7 +488,12 @@ def render_sub_question(
     has_res_t  = scores.get(skey(q_idx, s_idx, "结果")) is not None
     both_done  = has_prog_t and has_res_t
     status_icon = "✅" if both_done else "⏳"
-    sub_title = f"{status_icon} ({s_idx})　{stu_sub.question_text[:80] if stu_sub else ''}"
+    # Strip leading sub-question number like "(1)" from question_text to avoid duplicate display
+    q_text = ""
+    if stu_sub:
+        q_text = re.sub(r"^[（(]\d+[）)]\s*", "", stu_sub.question_text)
+        q_text = q_text[:80]
+    sub_title = f"{status_icon} ({s_idx})　{q_text}"
 
     # Left accent border + main content
     accent_color = "#4ade80" if both_done else "#e2e8f0"
@@ -483,7 +501,7 @@ def render_sub_question(
     with accent:
         st.markdown(f'<div style="background:{accent_color};border-radius:3px;height:100%;min-height:80px;">&nbsp;</div>', unsafe_allow_html=True)
     with main_col:
-        st.markdown(f"**{sub_title}**　(5分 — 程序3分 + 结果2分)")
+        st.markdown(f"**{sub_title}**")
 
         # ---- 程序 section ----
         col1, col2, col3 = st.columns([3, 3, 2])
@@ -512,13 +530,14 @@ def render_sub_question(
             current_prog = scores.get(score_key_prog, None)
             prog_options = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
             prog_idx = None if current_prog is None else (prog_options.index(current_prog) if current_prog in prog_options else None)
+            st.markdown("**程序得分：**")
             prog_score = st.radio(
-                f"程序分",
+                "程序分",
                 options=prog_options,
                 index=prog_idx,
                 format_func=lambda x: f"{x:.0f}" if x == int(x) else f"{x:.1f}",
                 horizontal=True,
-                key=f"{sub_file}-{q_idx}-{s_idx}-prog",
+                key=f"{sub_file}-{q_idx}-{s_idx}-prog-v{st.session_state.reset_version}",
                 help="程序(代码截图) 满分3分",
                 label_visibility="collapsed",
             )
@@ -553,13 +572,14 @@ def render_sub_question(
             current_res = scores.get(score_key_res, None)
             res_options = [0, 0.5, 1.0, 1.5, 2.0]
             res_idx = None if current_res is None else (res_options.index(current_res) if current_res in res_options else None)
+            st.markdown("**结果得分：**")
             res_score = st.radio(
-                f"结果分",
+                "结果分",
                 options=res_options,
                 index=res_idx,
                 format_func=lambda x: f"{x:.0f}" if x == int(x) else f"{x:.1f}",
                 horizontal=True,
-                key=f"{sub_file}-{q_idx}-{s_idx}-res",
+                key=f"{sub_file}-{q_idx}-{s_idx}-res-v{st.session_state.reset_version}",
                 help="结果(输出截图) 满分2分",
                 label_visibility="collapsed",
             )
@@ -589,18 +609,19 @@ def main():
     # ---- Custom CSS for better appearance ----
     st.markdown("""
     <style>
-        /* Score radio buttons as clickable chips */
+        /* Score radio buttons as larger clickable chips */
         div[data-testid="stRadio"] > div {
-            gap: 0.15rem !important;
+            gap: 0.3rem !important;
             flex-wrap: wrap;
         }
         div[data-testid="stRadio"] label {
             border: 1px solid #d0d5dd;
-            border-radius: 6px;
-            padding: 0.15rem 0.45rem;
-            margin: 0.1rem 0.05rem !important;
+            border-radius: 8px;
+            padding: 0.3rem 0.65rem;
+            margin: 0.15rem 0.1rem !important;
             background: #f8f9fa;
-            font-size: 0.85rem !important;
+            font-size: 1rem !important;
+            font-weight: 500;
             transition: all 0.1s ease;
         }
         div[data-testid="stRadio"] label:hover {
@@ -611,7 +632,13 @@ def main():
         div[data-testid="stRadio"] input:checked + div {
             background: #dbeafe !important;
             border-color: #3b82f6 !important;
+            font-weight: 700;
+        }
+        /* Score label styling */
+        .score-label {
+            font-size: 1rem;
             font-weight: 600;
+            margin-bottom: 0.2rem;
         }
         /* Compact captions */
         .stCaption {
