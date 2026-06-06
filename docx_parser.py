@@ -236,19 +236,48 @@ def extract_student_info(doc: Document) -> StudentInfo:
 # Question structure parsing
 # ---------------------------------------------------------------------------
 
-_MAJOR_RE = re.compile(r"^(?:[一二三四]|\d+)\s*[.、].{4,}")  # require meaningful content after the number
-_SUB_RE   = re.compile(r"^[（(](\d+)[）)]")
+_MAJOR_RE = re.compile(r"^[一二三四]\s*[、.].{4,}")   # only Chinese numerals for major Qs
+_SUB_TITLE_RE = re.compile(r"^(\d+)\s*[.、]\s*.{2,}")  # "1.生成数据并查看（5分）" — sub-question section titles
+_SUB_RE   = re.compile(r"^[（(](\d+)[）)]")           # parenthetical detail markers "(1)", "（1）"
 _PROG_RE  = re.compile(r"^程序[：:]")
 _RESULT_RE = re.compile(r"^结果[：:]")
 _EMPTY_PAT = re.compile(r"^\s*$")
 
 
-def parse_questions(doc: Document) -> List[MajorQuestion]:
+# ---------------------------------------------------------------------------
+# Format detection
+# ---------------------------------------------------------------------------
+
+def _has_cn_major_headers(doc: Document) -> bool:
+    """Pre-scan: does this document use 一、二、三、四 for major questions?"""
+    for para in doc.paragraphs:
+        text = para_text(para)
+        if _MAJOR_RE.search(text):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Question structure parsing
+# ---------------------------------------------------------------------------
+
+_MAJOR_RE = re.compile(r"^[一二三四]\s*[、.].{4,}")   # only Chinese numerals for major Qs
+_SUB_TITLE_RE = re.compile(r"^(\d+)\s*[.、]\s*.{2,}")  # "1.生成数据并查看（5分）" — section titles
+_SUB_RE   = re.compile(r"^[（(](\d+)[）)]")           # parenthetical detail markers "(1)", "（1）"
+_PROG_RE  = re.compile(r"^程序[：:]")
+_RESULT_RE = re.compile(r"^结果[：:]")
+_EMPTY_PAT = re.compile(r"^\s*$")
+
+
+def parse_questions(doc: Document, has_cn_major: bool = False) -> List[MajorQuestion]:
     """
     Core state-machine parser.
 
-    States: SEEK_MAJOR → IN_MAJOR(accumulate title) → IN_SUB →
-            (on 程序/结果 label) → capture next image/text → back to IN_SUB
+    Two formats are supported:
+      - Format A (has_cn_major=False): "1.XXX" = major Q, "(N)" = sub-Q (e.g. eg1.docx)
+      - Format B (has_cn_major=True):  "一.XXX" = major Q, "1.XXX" = sub-Q, "(N)" = detail (e.g. 2_asr.docx)
+
+    States: SEEK_MAJOR → IN_SUB → (on 程序/结果 label) → CAPTURE_IMAGE → back to IN_SUB
     """
     questions: List[MajorQuestion] = []
     cur_q: Optional[MajorQuestion] = None
@@ -266,38 +295,27 @@ def parse_questions(doc: Document) -> List[MajorQuestion]:
         if state == "SEEK_MAJOR":
             if _MAJOR_RE.search(text):
                 if len(questions) >= 4:
-                    continue  # ignore extra matches past 4 questions
+                    continue
+                cur_q = MajorQuestion(index=len(questions) + 1, title=text)
+                questions.append(cur_q)
+                state = "IN_SUB"
+                sub_text_buffer = []
+            elif not has_cn_major and _SUB_TITLE_RE.match(text):
+                # Format A: "1.XXX" is the major question header
+                if len(questions) >= 4:
+                    continue
                 cur_q = MajorQuestion(index=len(questions) + 1, title=text)
                 questions.append(cur_q)
                 state = "IN_SUB"
                 sub_text_buffer = []
             continue
 
-        # ---------- IN_MAJOR (accumulate title) ----------
-        if state == "IN_MAJOR":
-            if _MAJOR_RE.search(text):
-                cur_q.title = text
-                state = "IN_SUB"
-                sub_text_buffer = []
-            elif _SUB_RE.search(text):
-                # Sub-question found — save title buffer as title
-                cur_q.title = " ".join(sub_text_buffer) if sub_text_buffer else text
-                sub_text_buffer = []
-                m = _SUB_RE.match(text)
-                sub_idx = int(m.group(1))
-                cur_sub = SubQuestion(index=sub_idx, question_text=text)
-                cur_q.sub_questions.append(cur_sub)
-                state = "IN_SUB"
-            else:
-                sub_text_buffer.append(text)
-            continue
-
         # ---------- IN_SUB ----------
         if state == "IN_SUB":
-            # Check for next major question
             if _MAJOR_RE.search(text):
+                # Format B: Chinese numeral → next major question
                 if len(questions) >= 4:
-                    continue  # ignore extra matches past 4 questions
+                    continue
                 cur_q = MajorQuestion(index=len(questions) + 1, title=text)
                 questions.append(cur_q)
                 state = "IN_SUB"
@@ -305,17 +323,42 @@ def parse_questions(doc: Document) -> List[MajorQuestion]:
                 cur_sub = None
                 continue
 
-            # Check for sub-question marker
+            m_st = _SUB_TITLE_RE.match(text)
+            if m_st:
+                sub_idx = int(m_st.group(1))
+                if has_cn_major:
+                    # Format B: "1.XXX" → sub-question under current major
+                    cur_sub = SubQuestion(index=sub_idx, question_text=text)
+                    cur_q.sub_questions.append(cur_sub)
+                else:
+                    # Format A: "1.XXX" → next major question
+                    if len(questions) >= 4:
+                        # Past 4 majors — treat as text
+                        if cur_sub is not None:
+                            cur_sub.question_text += "\n" + text
+                        continue
+                    cur_q = MajorQuestion(index=len(questions) + 1, title=text)
+                    questions.append(cur_q)
+                    sub_text_buffer = []
+                    cur_sub = None
+                continue
+
+            # Check for sub-question / detail marker "(1)", "（1）"
             m = _SUB_RE.match(text)
             if m:
                 sub_idx = int(m.group(1))
-                cur_sub = SubQuestion(index=sub_idx, question_text=text)
-                cur_q.sub_questions.append(cur_sub)
+                if has_cn_major:
+                    # Format B: parenthetical markers are detail text, not sub-questions
+                    if cur_sub is not None and text:
+                        cur_sub.question_text += "\n" + text
+                else:
+                    # Format A: "(N)" is the actual sub-question marker
+                    cur_sub = SubQuestion(index=sub_idx, question_text=text)
+                    cur_q.sub_questions.append(cur_sub)
                 continue
 
             # Check for 程序 label
             if _PROG_RE.match(text):
-                # If image is in the SAME paragraph as the label, capture immediately
                 img_bytes = get_image_bytes(para, doc)
                 if img_bytes is not None:
                     if cur_sub is not None:
@@ -327,7 +370,6 @@ def parse_questions(doc: Document) -> List[MajorQuestion]:
 
             # Check for 结果 label
             if _RESULT_RE.match(text):
-                # If image is in the SAME paragraph as the label, capture immediately
                 img_bytes = get_image_bytes(para, doc)
                 if img_bytes is not None:
                     if cur_sub is not None:
@@ -344,9 +386,34 @@ def parse_questions(doc: Document) -> List[MajorQuestion]:
 
         # ---------- CAPTURE_IMAGE ----------
         if state == "CAPTURE_IMAGE":
-            # Check if a new sub-question starts before we captured anything
-            if _SUB_RE.match(text):
-                # Mark current section as missing, close it, start new sub
+            # If a section label appears while waiting for image, update pending section
+            if _PROG_RE.match(text):
+                pending_section = "程序"
+                continue
+            if _RESULT_RE.match(text):
+                pending_section = "结果"
+                continue
+
+            # Check if a new section/sub-question starts before we captured anything
+            new_sub = False
+            new_major = False
+            m_st = _SUB_TITLE_RE.match(text)
+            m_sr = _SUB_RE.match(text) if not m_st else None
+            if m_st:
+                sub_idx = int(m_st.group(1))
+                if has_cn_major:
+                    new_sub = True       # Format B: "1.XXX" → new sub-Q
+                else:
+                    new_major = True     # Format A: "1.XXX" → next major Q
+            elif m_sr:
+                sub_idx = int(m_sr.group(1))
+                if has_cn_major:
+                    new_sub = False      # Format B: skip detail marker in capture state
+                else:
+                    new_sub = True       # Format A: "(N)" → new sub-Q
+
+            if new_sub or new_major:
+                # Mark current section as missing, close it
                 section = ImageSection(
                     section_type=pending_section, is_missing=True
                 )
@@ -356,11 +423,16 @@ def parse_questions(doc: Document) -> List[MajorQuestion]:
                     elif pending_section == "结果":
                         cur_sub.result = section
                 pending_section = None
-                # Now process this paragraph as a new sub-question
-                m = _SUB_RE.match(text)
-                sub_idx = int(m.group(1))
-                cur_sub = SubQuestion(index=sub_idx, question_text=text)
-                cur_q.sub_questions.append(cur_sub)
+
+                if new_major:
+                    if len(questions) >= 4:
+                        continue  # ignore past 4 majors
+                    cur_q = MajorQuestion(index=len(questions) + 1, title=text)
+                    questions.append(cur_q)
+                    cur_sub = None
+                else:
+                    cur_sub = SubQuestion(index=sub_idx, question_text=text)
+                    cur_q.sub_questions.append(cur_sub)
                 state = "IN_SUB"
                 continue
 
@@ -417,7 +489,8 @@ def parse_student_docx(file_path: str) -> StudentSubmission:
     """
     doc = Document(file_path)
     info = extract_student_info(doc)
-    questions = parse_questions(doc)
+    has_cn_major = _has_cn_major_headers(doc)
+    questions = parse_questions(doc, has_cn_major=has_cn_major)
 
     # Ensure 4 major questions with 5 sub-questions each
     for q_idx, q in enumerate(questions):
@@ -444,7 +517,8 @@ def parse_reference_docx(file_path: str) -> List[MajorQuestion]:
     Returns list of MajorQuestion (no student info).
     """
     doc = Document(file_path)
-    return parse_questions(doc)
+    has_cn_major = _has_cn_major_headers(doc)
+    return parse_questions(doc, has_cn_major=has_cn_major)
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,8 @@ Scoring rules:
 from __future__ import annotations
 
 import os
-from typing import Dict, List
+from io import BytesIO
+from typing import Dict, List, Optional
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side, numbers
@@ -94,8 +95,8 @@ def _style_data(ws, row: int, max_col: int, score_cols: set):
 def export_to_xlsx(
     submissions: List[StudentSubmission],
     all_scores: Dict[str, Dict[str, float]],
-    output_path: str,
-) -> str:
+    output_path: Optional[str] = None,
+) -> bytes:
     """
     Generate grading spreadsheet.
 
@@ -178,9 +179,17 @@ def export_to_xlsx(
                 cell.fill = PatternFill(start_color="FFF8E1", end_color="FFF8E1", fill_type="solid")
                 cell.font = Font(bold=True)
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    wb.save(output_path)
-    return output_path
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    xlsx_bytes = buf.getvalue()
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(xlsx_bytes)
+
+    return xlsx_bytes
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ Usage:
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -51,6 +52,10 @@ STATE_DEFAULTS = {
     "current_student": None,         # str — filename key
     "current_tab": 0,                # int — question tab
     "reset_version": 0,              # int — bumped on student score reset, appended to widget keys
+    "scoring_rubric": None,          # dict — loaded from points.json
+    "scoring_rubric_file": None,     # UploadedFile — the uploaded .json file
+    "scoring_rubric_filename": None,  # str
+    "checkmarks": {},                # Dict[str, Dict[str, bool]]  (filename -> {checkmark_key: bool})
 }
 
 for key, val in STATE_DEFAULTS.items():
@@ -64,6 +69,118 @@ for key, val in STATE_DEFAULTS.items():
 
 def skey(major: int, sub: int, section: str) -> str:
     return f"{major}-{sub}-{section}"
+
+# ---------------------------------------------------------------------------
+# Helper: scoring rubric lookup
+# ---------------------------------------------------------------------------
+
+_SECTION_KEY_MAP = {
+    "程序": "program",
+    "结果": "result",
+}
+
+
+def get_rubric_for(q_idx: int, s_idx: int) -> Optional[dict]:
+    """Look up scoring rubric for a (major, sub) question from points.json."""
+    rubric = st.session_state.scoring_rubric
+    if not rubric:
+        return None
+    sections = rubric.get("sections", [])
+    section_idx = q_idx - 1
+    if section_idx < 0 or section_idx >= len(sections):
+        return None
+    subs = sections[section_idx].get("sub_questions", [])
+    sub_idx = s_idx - 1
+    if sub_idx < 0 or sub_idx >= len(subs):
+        return None
+    return subs[sub_idx]
+
+
+def compute_section_score(fname: str, q_idx: int, s_idx: int, section_cn: str) -> float:
+    """Compute numeric section score from checked rubric points."""
+    rubric_data = get_rubric_for(q_idx, s_idx)
+    if not rubric_data:
+        return 0.0
+    section_en = _SECTION_KEY_MAP.get(section_cn)
+    if not section_en or section_en not in rubric_data:
+        return 0.0
+    section_data = rubric_data[section_en]
+    points = section_data.get("points", [])
+    max_score = section_data.get("max_score", 3.0)
+    if not points:
+        return 0.0
+    total = 0.0
+    cm = st.session_state.checkmarks.get(fname, {})
+    for i, p in enumerate(points):
+        cm_key = f"{q_idx}-{s_idx}-{section_cn}-{i}"
+        if cm.get(cm_key, False):
+            total += p.get("score", 0)
+    return min(total, max_score)
+
+
+def render_scoring_checkboxes(
+    fname: str,
+    q_idx: int,
+    s_idx: int,
+    section_cn: str,
+    rubric_data: Optional[dict],
+):
+    """Render checkbox-based scoring for one section (程序/结果).
+
+    Each rubric point gets a checkbox; total = sum of checked points.
+    """
+    section_en = _SECTION_KEY_MAP.get(section_cn)
+    if not rubric_data or not section_en or section_en not in rubric_data:
+        st.caption("📋 暂无评分标准")
+        return
+
+    section_data = rubric_data[section_en]
+    points = section_data.get("points", [])
+    max_score = section_data.get("max_score", 3)
+
+    if not points:
+        st.caption("📋 暂无评分标准")
+        return
+
+    st.markdown(f"**{section_cn}得分:**")
+
+    total = 0.0
+    changed = False
+    cm = st.session_state.checkmarks.get(fname, {})
+    rv = st.session_state.reset_version
+
+    for i, p in enumerate(points):
+        cm_key = f"{q_idx}-{s_idx}-{section_cn}-{i}"
+        widget_key = f"ck-{fname}-{q_idx}-{s_idx}-{section_cn}-{i}-v{rv}"
+        is_checked = cm.get(cm_key, False)
+
+        checked = st.checkbox(
+            f"{p['item']}  ({p['score']}分)",
+            value=is_checked,
+            key=widget_key,
+        )
+
+        if checked != is_checked:
+            if fname not in st.session_state.checkmarks:
+                st.session_state.checkmarks[fname] = {}
+            st.session_state.checkmarks[fname][cm_key] = checked
+            changed = True
+
+        if checked:
+            total += p["score"]
+
+    total = min(total, max_score)
+
+    # Show computed total
+    st.markdown(f"**合计: {total:.1f} / {max_score}**")
+
+    if changed:
+        # Sync numeric scores dict so export / progress work as before
+        if fname not in st.session_state.scores:
+            st.session_state.scores[fname] = {}
+        st.session_state.scores[fname][skey(q_idx, s_idx, section_cn)] = total
+        save_scores()
+
 
 # ---------------------------------------------------------------------------
 # Helper: ensure scores dict structure
@@ -81,12 +198,13 @@ AUTOSAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output
 
 
 def save_scores():
-    """Write current scores dict + reference signature to autosave JSON."""
+    """Write current scores + checkmarks + reference signature to autosave JSON."""
     try:
         os.makedirs(os.path.dirname(AUTOSAVE_PATH), exist_ok=True)
         data = {
             "ref_sig": st.session_state.reference_signature,
             "scores": st.session_state.scores,
+            "checkmarks": st.session_state.checkmarks,
         }
         with open(AUTOSAVE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -95,19 +213,16 @@ def save_scores():
 
 
 def load_scores():
-    """Restore scores from autosave JSON (only if reference signature matches)."""
+    """Restore scores and checkmarks from autosave JSON (only if reference signature matches)."""
     if not os.path.exists(AUTOSAVE_PATH):
         return
     try:
         with open(AUTOSAVE_PATH, "r", encoding="utf-8") as f:
             saved = json.load(f)
-        # Signature guard — only restore if the same reference doc is loaded
+        # Signature guard — only restore if the same reference doc is loaded.
+        # Never delete the file — it survives page refreshes so the user can
+        # upload the same reference doc later and pick up where they left off.
         if saved.get("ref_sig") != st.session_state.reference_signature:
-            # Delete stale autosave from old/other reference
-            try:
-                os.remove(AUTOSAVE_PATH)
-            except Exception:
-                pass
             return
         for fname, fdata in saved.get("scores", {}).items():
             if fname not in st.session_state.scores:
@@ -115,8 +230,109 @@ def load_scores():
             for k, v in fdata.items():
                 if v is not None:
                     st.session_state.scores[fname][k] = v
+        # Restore checkmarks
+        saved_cm = saved.get("checkmarks", {})
+        for fname, cm_data in saved_cm.items():
+            if fname not in st.session_state.checkmarks:
+                st.session_state.checkmarks[fname] = {}
+            for k, v in cm_data.items():
+                st.session_state.checkmarks[fname][k] = bool(v)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# student_points.txt — per-point scoring record
+# ---------------------------------------------------------------------------
+# Generate points text (no longer auto-saves — download buttons used instead)
+# ---------------------------------------------------------------------------
+
+
+def generate_points_text() -> str:
+    """Build a human-readable per-point scoring record for all students."""
+    lines = []
+    lines.append("=" * 80)
+    lines.append("学生评分明细记录")
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"生成时间: {now_str}")
+    lines.append("=" * 80)
+
+    for fname in sorted(st.session_state.submissions.keys()):
+        sub = st.session_state.submissions.get(fname)
+        if not sub:
+            continue
+        info = sub.student_info
+        scores = st.session_state.scores.get(fname, {})
+
+        lines.append("")
+        lines.append("-" * 80)
+        lines.append(f"学生: {info.name or '未知'}  |  学号: {info.student_id or '未知'}  |  班级: {info.class_name or '未知'}")
+        lines.append(f"文件名: {fname}")
+        lines.append("-" * 80)
+
+        for q in sub.major_questions:
+            lines.append("")
+            lines.append(f"  ◆ 第{q.index}题  {q.title[:80]}")
+
+            for s in q.sub_questions:
+                q_text = re.sub(r"^[（(]\d+[）)]\s*", "", s.question_text)[:60]
+                lines.append(f"    ({s.index}) {q_text}")
+
+                for section_cn in ["程序", "结果"]:
+                    rubric_data = get_rubric_for(q.index, s.index)
+                    section_en = _SECTION_KEY_MAP.get(section_cn)
+                    points = []
+                    max_score = 0
+                    if rubric_data and section_en and section_en in rubric_data:
+                        points = rubric_data[section_en].get("points", [])
+                        max_score = rubric_data[section_en].get("max_score", 3)
+
+                    checked_items = []
+                    cm = st.session_state.checkmarks.get(fname, {})
+                    for i, p in enumerate(points):
+                        cm_key = f"{q.index}-{s.index}-{section_cn}-{i}"
+                        if cm.get(cm_key, False):
+                            checked_items.append(f"           ✓ {p['item']} (+{p['score']}分)")
+
+                    total = scores.get(skey(q.index, s.index, section_cn), 0.0)
+                    lines.append(f"      {section_cn}: {total:.1f}/{max_score} 分")
+                    if checked_items:
+                        lines.extend(checked_items)
+                    else:
+                        lines.append(f"        (无得分点)")
+
+                sub_total = min(
+                    scores.get(skey(q.index, s.index, "程序"), 0.0)
+                    + scores.get(skey(q.index, s.index, "结果"), 0.0),
+                    SCORE_CONFIG["sub_max"],
+                )
+                lines.append(f"      → 本小题: {sub_total:.1f}/{SCORE_CONFIG['sub_max']} 分")
+
+            # Major total
+            q_total = sum(
+                min(
+                    scores.get(skey(q.index, s.index, "程序"), 0.0)
+                    + scores.get(skey(q.index, s.index, "结果"), 0.0),
+                    SCORE_CONFIG["sub_max"],
+                )
+                for s in q.sub_questions
+            )
+            lines.append(f"    ★ 第{q.index}题总分: {q_total:.1f} / 25")
+
+        # Grand total
+        grand_total = sum(
+            min(
+                scores.get(skey(q.index, s.index, "程序"), 0.0)
+                + scores.get(skey(q.index, s.index, "结果"), 0.0),
+                SCORE_CONFIG["sub_max"],
+            )
+            for q in sub.major_questions
+            for s in q.sub_questions
+        )
+        lines.append(f"")
+        lines.append(f"  ★★★ 总分: {grand_total:.1f} / 100 ★★★")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -146,49 +362,44 @@ def check_incomplete_grading(student_names: List[str]) -> List[tuple]:
 
 
 # ---------------------------------------------------------------------------
+# Navigation warning — warn on incomplete page when switching students
+# ---------------------------------------------------------------------------
+
+def get_missing_on_current_page(fname: str) -> List[str]:
+    """Return missing score items for the currently displayed major question."""
+    if not fname:
+        return []
+    q_idx = st.session_state.current_tab
+    scores = st.session_state.scores.get(fname, {})
+    missing = []
+    for s in range(1, 6):
+        if scores.get(skey(q_idx + 1, s, "程序")) is None:
+            missing.append(f"Q{q_idx+1}({s})程序")
+        if scores.get(skey(q_idx + 1, s, "结果")) is None:
+            missing.append(f"Q{q_idx+1}({s})结果")
+    return missing
+
+
+def navigate_student(target_student: str):
+    """Switch current_student, showing warning if current page has ungraded items."""
+    current = st.session_state.current_student
+    if current:
+        missing = get_missing_on_current_page(current)
+        if missing:
+            q_cn = "一二三四"[st.session_state.current_tab]
+            st.session_state._nav_warning = (
+                f"⚠️ 第{q_cn}题还有 {len(missing)} 项未批改！"
+            )
+    st.session_state.current_student = target_student
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.title("📝 考试批改助手")
-
-    # ---- Reference docx ----
-    st.subheader("📄 参考答案文档")
-    ref_file = st.file_uploader(
-        "上传参考答案 .docx",
-        type=["docx"],
-        key="ref_uploader",
-        help="上传教师提供的参考答案Word文档",
-    )
-
-    if ref_file is not None and ref_file != st.session_state.reference_docx:
-        with st.spinner("正在解析参考答案..."):
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-                    tmp.write(ref_file.getbuffer())
-                    tmp_path = tmp.name
-                st.session_state.reference_questions = parse_reference_docx(tmp_path)
-                st.session_state.reference_signature = question_signature(
-                    st.session_state.reference_questions
-                )
-                st.session_state.reference_docx = ref_file
-                st.session_state.reference_filename = ref_file.name
-                os.unlink(tmp_path)
-                st.success(f"已加载参考答案: {ref_file.name}")
-                # 参考答案就绪后，尝试恢复匹配的 autosave 分数
-                load_scores()
-            except Exception as e:
-                st.error(f"解析失败: {e}")
-                st.session_state.reference_questions = None
-
-    if st.session_state.reference_questions:
-        qs = st.session_state.reference_questions
-        st.info(f"✅ 参考答案已加载 ({len(qs)} 大题)")
-        ref_sig = st.session_state.reference_signature or ""
-    else:
-        st.warning("请上传参考答案文档")
-
-    st.divider()
 
     # ---- Student docx files ----
     st.subheader("👥 学生答卷")
@@ -201,6 +412,19 @@ with st.sidebar:
     )
 
     if stu_files:
+        # ---- Sync: remove submissions for files no longer in uploader ----
+        current_names = {f.name for f in stu_files}
+        removed = [k for k in st.session_state.submissions if k not in current_names]
+        old_count = len(st.session_state.submissions)
+        for k in removed:
+            del st.session_state.submissions[k]
+            if k in st.session_state.scores:
+                del st.session_state.scores[k]
+            if k in st.session_state.checkmarks:
+                del st.session_state.checkmarks[k]
+        if removed:
+            st.rerun()
+
         # Process new files
         new_count = 0
         for f in stu_files:
@@ -211,7 +435,7 @@ with st.sidebar:
                             tmp.write(f.getbuffer())
                             tmp_path = tmp.name
                         sub = parse_student_docx(tmp_path)
-                        sub.filename = f.name  # 用原始文件名而非临时路径，保证与 scores key 一致
+                        sub.filename = f.name
                         st.session_state.submissions[f.name] = sub
                         init_scores(f.name)
                         os.unlink(tmp_path)
@@ -219,10 +443,12 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f"{f.name}: 解析失败 — {e}")
 
-        # Update file list
         st.session_state.student_files = stu_files
         if new_count > 0:
             st.success(f"已解析 {new_count} 份答卷")
+    else:
+        # DON'T auto-clear submissions — prevents data loss when uploader briefly returns empty on rerun
+        pass
 
     # ---- Student selector ----
     student_names = list(st.session_state.submissions.keys())
@@ -240,17 +466,17 @@ with st.sidebar:
 
         col1, col2, col3 = st.columns([1, 2, 1])
         with col1:
-            if st.button("◀ 上一人", use_container_width=True) and idx > 0:
-                st.session_state.current_student = student_names[idx - 1]
-                st.rerun()
+            if st.button("◀ 上一人", use_container_width=True, key="side_prev_stu"):
+                if idx > 0:
+                    navigate_student(student_names[idx - 1])
         with col2:
             st.caption(f"{idx + 1} / {len(student_names)}")
         with col3:
-            if st.button("下一人 ▶", use_container_width=True) and idx < len(student_names) - 1:
-                st.session_state.current_student = student_names[idx + 1]
-                st.rerun()
+            if st.button("下一人 ▶", use_container_width=True, key="side_next_stu"):
+                if idx < len(student_names) - 1:
+                    navigate_student(student_names[idx + 1])
 
-        # Dropdown selector
+        # Dropdown selector — track last user-selected value to detect real interactions
         sel = st.selectbox(
             "选择学生",
             student_names,
@@ -258,9 +484,19 @@ with st.sidebar:
             label_visibility="collapsed",
             key="student_selector",
         )
-        if sel != current:
+        # Only update current_student when the user explicitly selects from the dropdown
+        # (not when a nav button or other code changed current_student)
+        last_sel = st.session_state.get("_last_sel_student")
+        if last_sel is None:
+            st.session_state._last_sel_student = sel
+        elif sel != last_sel:
+            # User selected a different student from the dropdown
+            st.session_state._last_sel_student = sel
             st.session_state.current_student = sel
             st.rerun()
+        elif st.session_state.current_student != sel:
+            # Nav button changed current_student — sync tracker to selectbox's displayed value
+            st.session_state._last_sel_student = sel
 
         # Show student info
         sub = st.session_state.submissions[current]
@@ -271,7 +507,7 @@ with st.sidebar:
                 st.caption(info.class_name)
 
         # ---- Progress (current student, sub-question count) ----
-        sub_qs = sum(len(q.sub_questions) for q in sub.major_questions)  # e.g. 20
+        sub_qs = sum(len(q.sub_questions) for q in sub.major_questions)
         graded_sub = sum(
             1 for q in sub.major_questions
             for s in q.sub_questions
@@ -284,15 +520,48 @@ with st.sidebar:
         if st.button("🔄 重置当前学生分数", use_container_width=True):
             if current in st.session_state.scores:
                 st.session_state.scores[current] = {}
-                st.session_state.reset_version += 1
-                save_scores()
-                st.rerun()
+            if current in st.session_state.checkmarks:
+                st.session_state.checkmarks[current] = {}
+            st.session_state.reset_version += 1
+            save_scores()
+            st.rerun()
 
         # ---- Variant check ----
         if st.session_state.reference_signature:
             stu_sig = question_signature(sub.major_questions)
             if stu_sig != st.session_state.reference_signature:
                 st.warning("⚠️ 学生答卷与参考答案的题目不一致，请确认！")
+
+        # ---- Question selector (global) ----
+        st.divider()
+        st.subheader("📌 当前批改题号")
+        q_count = 4
+        q_cols = st.columns(q_count)
+        for i in range(q_count):
+            with q_cols[i]:
+                is_active = st.session_state.current_tab == i
+                if st.button(
+                    f"第{'一二三四'[i]}题",
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary",
+                    key=f"sidebar_q_{i}",
+                ):
+                    st.session_state.current_tab = i
+                    st.rerun()
+        # Progress for current question across all students
+        q_idx = st.session_state.current_tab
+        total_stu = len(student_names)
+        graded_stu = sum(
+            1 for fname in student_names
+            if all(
+                st.session_state.scores.get(fname, {}).get(skey(q_idx + 1, s, "程序")) is not None
+                and st.session_state.scores.get(fname, {}).get(skey(q_idx + 1, s, "结果")) is not None
+                for s in range(1, 6)
+            )
+        )
+        if total_stu > 0:
+            st.progress(graded_stu / total_stu,
+                        text=f"第{'一二三四'[q_idx]}题 — {graded_stu}/{total_stu} 人已完成")
 
         # ---- Export ----
         st.divider()
@@ -317,20 +586,149 @@ with st.sidebar:
             )
             try:
                 subs = [st.session_state.submissions[f] for f in student_names]
-                path = export_to_xlsx(subs, st.session_state.scores, export_path)
-                st.success(f"已导出: {path}")
-                # Offer download
-                with open(path, "rb") as fb:
-                    st.download_button(
-                        "⬇ 下载 xlsx",
-                        data=fb,
-                        file_name="批改成绩.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+                xlsx_bytes = export_to_xlsx(subs, st.session_state.scores)
+                points_text = generate_points_text()
+                st.session_state._export_xlsx = xlsx_bytes
+                st.session_state._export_points = points_text
+                st.session_state._export_ready = True
+                st.rerun()
             except Exception as e:
                 st.error(f"导出失败: {e}")
+
+        # Show download buttons after export data is generated
+        if st.session_state.get("_export_ready"):
+            st.divider()
+            st.subheader("📥 下载文件")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "\U0001F4E5 批改成绩.xlsx",
+                    data=st.session_state._export_xlsx,
+                    file_name="批改成绩.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with col2:
+                st.download_button(
+                    "\U0001F4E5 得分点记录.txt",
+                    data=st.session_state._export_points,
+                    file_name="student_points.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            if st.button("\U0001F504 重新生成", use_container_width=True):
+                st.session_state._export_ready = False
+                st.rerun()
     else:
         st.info("请上传学生答卷文件")
+
+    st.divider()
+
+    # ---- Autosave management ----
+    if os.path.exists(AUTOSAVE_PATH):
+        if st.button("🗑️ 清除自动保存记录 (autosave.json)", use_container_width=True,
+                     key="clear_autosave"):
+            try:
+                os.remove(AUTOSAVE_PATH)
+                st.success("已清除自动保存记录")
+                st.rerun()
+            except Exception as e:
+                st.error(f"清除失败: {e}")
+
+    st.divider()
+
+    # ---- Combined reference / rubric uploader ----
+    st.subheader("📄 参考答案 / 📋 评分标准")
+    ref_rubric_files = st.file_uploader(
+        "上传 .docx (参考答案) 或 .json (评分标准)",
+        type=["docx", "json"],
+        accept_multiple_files=True,
+        key="ref_rubric_uploader",
+        help="上传参考答案文档(.docx)和/或评分标准文件(.json)，根据文件扩展名自动识别",
+    )
+
+    # Determine what file types are currently uploaded
+    current_docx = None
+    current_json = None
+    if ref_rubric_files:
+        for f in ref_rubric_files:
+            if f.name.lower().endswith(".docx"):
+                current_docx = f
+            elif f.name.lower().endswith(".json"):
+                current_json = f
+
+    # --- Process reference docx (filename-based comparison — avoids UploadedFile identity issues on rerun) ---
+    if current_docx is not None:
+        if st.session_state.reference_filename != current_docx.name:
+            with st.spinner("正在解析参考答案..."):
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+                        tmp.write(current_docx.getbuffer())
+                        tmp_path = tmp.name
+                    st.session_state.reference_questions = parse_reference_docx(tmp_path)
+                    st.session_state.reference_signature = question_signature(
+                        st.session_state.reference_questions
+                    )
+                    st.session_state.reference_docx = current_docx
+                    st.session_state.reference_filename = current_docx.name
+                    os.unlink(tmp_path)
+                    st.success(f"已加载参考答案: {current_docx.name}")
+                    load_scores()
+                except Exception as e:
+                    st.error(f"参考答案解析失败: {e}")
+                    # Don't clear old state on re-parse failure — keep previous data
+    else:
+        # DON'T auto-clear — prevents data loss when uploader returns empty on transient rerun
+        pass
+
+    # --- Process rubric json (filename-based comparison) ---
+    if current_json is not None:
+        if st.session_state.scoring_rubric_filename != current_json.name:
+            with st.spinner("正在加载评分标准..."):
+                try:
+                    content = json.loads(current_json.getvalue().decode("utf-8"))
+                    if "sections" not in content:
+                        raise ValueError("JSON 文件中缺少 'sections' 字段")
+                    st.session_state.scoring_rubric = content
+                    st.session_state.scoring_rubric_file = current_json
+                    st.session_state.scoring_rubric_filename = current_json.name
+                    st.success(f"已加载: {current_json.name}")
+                except Exception as e:
+                    st.error(f"评分标准加载失败: {e}")
+                    # Don't clear old state on parse failure
+    else:
+        # DON'T auto-clear — prevents data loss on transient rerun
+        pass
+
+    # Show status of what's loaded
+    if st.session_state.reference_questions:
+        qs = st.session_state.reference_questions
+        st.info(f"✅ 参考答案: {st.session_state.reference_filename} ({len(qs)} 大题)")
+    elif current_docx is not None:
+        st.warning("请上传参考答案 (.docx) — 正在处理...")
+    elif st.session_state.reference_filename is None:
+        st.warning("请上传参考答案 (.docx)")
+
+    if st.session_state.scoring_rubric:
+        section_count = len(st.session_state.scoring_rubric.get("sections", []))
+        rubric_name = st.session_state.scoring_rubric_filename or "?"
+        st.info(f"✅ 评分标准: {rubric_name} ({section_count} 道大题)")
+    elif current_json is not None:
+        st.warning("请上传评分标准 (.json) — 正在处理...")
+    elif st.session_state.scoring_rubric_filename is None:
+        st.warning("请上传评分标准 (.json)")
+
+    # Clear button for loaded reference/rubric
+    if st.session_state.reference_questions or st.session_state.scoring_rubric:
+        if st.button("🗑️ 清除已加载的文件", use_container_width=True, key="clear_ref_rubric"):
+            st.session_state.reference_docx = None
+            st.session_state.reference_questions = None
+            st.session_state.reference_signature = None
+            st.session_state.reference_filename = None
+            st.session_state.scoring_rubric = None
+            st.session_state.scoring_rubric_file = None
+            st.session_state.scoring_rubric_filename = None
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +740,12 @@ def render_student_answer(
     ref_questions: Optional[List[MajorQuestion]],
 ):
     """Render grading UI for one student."""
+    # Show navigation warning (set by navigate_student if current page has ungraded items)
+    nav_warning = st.session_state.get("_nav_warning")
+    if nav_warning:
+        st.warning(nav_warning)
+        del st.session_state["_nav_warning"]
+
     submission = st.session_state.submissions.get(sub_file)
     if not submission:
         st.warning("请先选择一名学生")
@@ -362,70 +766,49 @@ def render_student_answer(
         title += f"　学号: {student_id}"
     st.markdown(f"# {title}")
 
-    # Progress summary
-    scores_local = scores
-    total_subs = sum(len(q.sub_questions) for q in submission.major_questions)
-    graded_subs = sum(
-        1 for q in submission.major_questions
-        for s in q.sub_questions
-        if scores_local.get(skey(q.index, s.index, "程序")) is not None
-           and scores_local.get(skey(q.index, s.index, "结果")) is not None
+    # ---- Prev / Next student navigation in main area ----
+    student_names = list(st.session_state.submissions.keys())
+    if len(student_names) > 1:
+        idx = student_names.index(sub_file)
+        nav_cols = st.columns([1, 2, 1])
+        with nav_cols[0]:
+            if st.button("◀ 上一人", use_container_width=True, key="main_prev_stu"):
+                if idx > 0:
+                    navigate_student(student_names[idx - 1])
+        with nav_cols[1]:
+            st.caption(f"**{idx + 1} / {len(student_names)}**")
+        with nav_cols[2]:
+            if st.button("下一人 ▶", use_container_width=True, key="main_next_stu"):
+                if idx < len(student_names) - 1:
+                    navigate_student(student_names[idx + 1])
+        st.divider()
+
+    # Progress: current question status for this student
+    q_idx = st.session_state.current_tab
+    graded_q_subs = sum(
+        1 for s in range(1, 6)
+        if scores.get(skey(q_idx + 1, s, "程序")) is not None
+           and scores.get(skey(q_idx + 1, s, "结果")) is not None
     )
     col_m1, col_m2, col_m3 = st.columns(3)
     with col_m1:
-        st.metric("已批改", f"{graded_subs}/{total_subs} 小题")
+        st.metric(f"第{'一二三四'[q_idx]}题 已批改", f"{graded_q_subs}/5 小题")
     with col_m2:
-        st.metric("未批改", f"{total_subs - graded_subs} 小题")
+        st.metric(f"第{'一二三四'[q_idx]}题 未批改", f"{5 - graded_q_subs} 小题")
     with col_m3:
-        if graded_subs > 0:
-            total_pts = sum(
+        if graded_q_subs > 0:
+            q_total = sum(
                 min(
-                    (scores_local.get(skey(q.index, s.index, "程序"), 0.0) +
-                     scores_local.get(skey(q.index, s.index, "结果"), 0.0)),
+                    (scores.get(skey(q_idx + 1, s, "程序"), 0.0) +
+                     scores.get(skey(q_idx + 1, s, "结果"), 0.0)),
                     SCORE_CONFIG["sub_max"],
                 )
-                for q in submission.major_questions
-                for s in q.sub_questions
-                if scores_local.get(skey(q.index, s.index, "程序")) is not None
-                   and scores_local.get(skey(q.index, s.index, "结果")) is not None
+                for s in range(1, 6)
+                if scores.get(skey(q_idx + 1, s, "程序")) is not None
+                   and scores.get(skey(q_idx + 1, s, "结果")) is not None
             )
-            st.metric("当前总分", f"{total_pts:.1f} / {total_subs * int(SCORE_CONFIG['sub_max'])}")
+            st.metric("本题得分", f"{q_total:.1f} / 25")
     st.divider()
-
-    # ---- Custom question tabs (top + bottom) ----
-    q_count = min(4, len(submission.major_questions))
-    tab_labels = [f"📌 第{'一二三四'[i]}题" for i in range(q_count)]
-
-    def render_tab_bar(key_prefix: str):
-        """Render a row of question-selector buttons with prev/next."""
-        cols = st.columns(q_count + 2)
-        # Previous button
-        with cols[0]:
-            if st.button("◀ 上一题", use_container_width=True, key=f"{key_prefix}_prev",
-                         disabled=(st.session_state.current_tab <= 0)):
-                st.session_state.current_tab -= 1
-                st.rerun()
-        # Question tabs
-        for i in range(q_count):
-            with cols[i + 1]:
-                is_active = st.session_state.current_tab == i
-                if st.button(
-                    tab_labels[i],
-                    use_container_width=True,
-                    type="primary" if is_active else "secondary",
-                    key=f"{key_prefix}_tab_{i}",
-                ):
-                    st.session_state.current_tab = i
-                    st.rerun()
-        # Next button
-        with cols[q_count + 1]:
-            if st.button("下一题 ▶", use_container_width=True, key=f"{key_prefix}_next",
-                         disabled=(st.session_state.current_tab >= q_count - 1)):
-                st.session_state.current_tab += 1
-                st.rerun()
-
-    # Top tab bar
-    render_tab_bar("top")
 
     # Render active question
     q_idx = st.session_state.current_tab
@@ -451,12 +834,23 @@ def render_student_answer(
             for s in range(1, 6)
         )
         st.markdown(f"**第{q_idx+1}题得分: {major_total:.1f} / 25**")
+
+        # Bottom navigation — prev/next student
+        if len(student_names) > 1:
+            st.divider()
+            bot_cols = st.columns([1, 2, 1])
+            with bot_cols[0]:
+                if st.button("◀ 上一人", use_container_width=True, key="bot_prev_stu"):
+                    if idx > 0:
+                        navigate_student(student_names[idx - 1])
+            with bot_cols[1]:
+                st.caption(f"**{idx + 1} / {len(student_names)}**")
+            with bot_cols[2]:
+                if st.button("下一人 ▶", use_container_width=True, key="bot_next_stu"):
+                    if idx < len(student_names) - 1:
+                        navigate_student(student_names[idx + 1])
     else:
         st.info("该大题无数据")
-
-    # Bottom tab bar
-    st.markdown("---")
-    render_tab_bar("bottom")
 
 
 def render_sub_question(
@@ -466,8 +860,9 @@ def render_sub_question(
     ref_q: Optional[MajorQuestion],
     sub_file: str,
 ):
-    """Render one sub-question with reference, student answer, and scoring."""
+    """Render one sub-question with reference, student answer, and checkbox scoring."""
     scores = st.session_state.scores.get(sub_file, {})
+    rubric_data = get_rubric_for(q_idx, s_idx)
 
     # Find sub-question data
     stu_sub = None
@@ -488,7 +883,6 @@ def render_sub_question(
     has_res_t  = scores.get(skey(q_idx, s_idx, "结果")) is not None
     both_done  = has_prog_t and has_res_t
     status_icon = "✅" if both_done else "⏳"
-    # Strip leading sub-question number like "(1)" from question_text to avoid duplicate display
     q_text = ""
     if stu_sub:
         q_text = re.sub(r"^[（(]\d+[）)]\s*", "", stu_sub.question_text)
@@ -504,11 +898,11 @@ def render_sub_question(
         st.markdown(f"**{sub_title}**")
 
         # ---- 程序 section ----
-        col1, col2, col3 = st.columns([3, 3, 2])
+        col1, col2, col3 = st.columns([4, 4, 2])
         with col1:
             st.caption("📖 参考答案 — 程序")
             if ref_sub and ref_sub.program and ref_sub.program.image_bytes:
-                st.image(ref_sub.program.image_bytes, use_container_width=True)
+                st.image(ref_sub.program.image_bytes, width='stretch')
             else:
                 st.info("无参考数据")
 
@@ -516,7 +910,7 @@ def render_sub_question(
             st.caption("📸 学生答案 — 程序")
             if stu_sub and stu_sub.program:
                 if stu_sub.program.image_bytes:
-                    st.image(stu_sub.program.image_bytes, use_container_width=True)
+                    st.image(stu_sub.program.image_bytes, width='stretch')
                 elif stu_sub.program.text_content:
                     st.text_area("文字答案", stu_sub.program.text_content, height=100, disabled=True,
                                 key=f"{sub_file}-{q_idx}-{s_idx}-prog-text")
@@ -526,31 +920,14 @@ def render_sub_question(
                 st.error("❌ 未作答")
 
         with col3:
-            score_key_prog = skey(q_idx, s_idx, "程序")
-            current_prog = scores.get(score_key_prog, None)
-            prog_options = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
-            prog_idx = None if current_prog is None else (prog_options.index(current_prog) if current_prog in prog_options else None)
-            st.markdown("**程序得分：**")
-            prog_score = st.radio(
-                "程序分",
-                options=prog_options,
-                index=prog_idx,
-                format_func=lambda x: f"{x:.0f}" if x == int(x) else f"{x:.1f}",
-                horizontal=True,
-                key=f"{sub_file}-{q_idx}-{s_idx}-prog-v{st.session_state.reset_version}",
-                help="程序(代码截图) 满分3分",
-                label_visibility="collapsed",
-            )
-            if prog_score is not None and prog_score != current_prog:
-                st.session_state.scores[sub_file][score_key_prog] = prog_score
-                save_scores()
+            render_scoring_checkboxes(sub_file, q_idx, s_idx, "程序", rubric_data)
 
         # ---- 结果 section ----
-        col1, col2, col3 = st.columns([3, 3, 2])
+        col1, col2, col3 = st.columns([4, 4, 2])
         with col1:
             st.caption("📖 参考答案 — 结果")
             if ref_sub and ref_sub.result and ref_sub.result.image_bytes:
-                st.image(ref_sub.result.image_bytes, use_container_width=True)
+                st.image(ref_sub.result.image_bytes, width='stretch')
             else:
                 st.info("无参考数据")
 
@@ -558,7 +935,7 @@ def render_sub_question(
             st.caption("📸 学生答案 — 结果")
             if stu_sub and stu_sub.result:
                 if stu_sub.result.image_bytes:
-                    st.image(stu_sub.result.image_bytes, use_container_width=True)
+                    st.image(stu_sub.result.image_bytes, width='stretch')
                 elif stu_sub.result.text_content:
                     st.text_area("文字答案", stu_sub.result.text_content, height=100, disabled=True,
                                 key=f"{sub_file}-{q_idx}-{s_idx}-res-text")
@@ -568,24 +945,7 @@ def render_sub_question(
                 st.error("❌ 未作答")
 
         with col3:
-            score_key_res = skey(q_idx, s_idx, "结果")
-            current_res = scores.get(score_key_res, None)
-            res_options = [0, 0.5, 1.0, 1.5, 2.0]
-            res_idx = None if current_res is None else (res_options.index(current_res) if current_res in res_options else None)
-            st.markdown("**结果得分：**")
-            res_score = st.radio(
-                "结果分",
-                options=res_options,
-                index=res_idx,
-                format_func=lambda x: f"{x:.0f}" if x == int(x) else f"{x:.1f}",
-                horizontal=True,
-                key=f"{sub_file}-{q_idx}-{s_idx}-res-v{st.session_state.reset_version}",
-                help="结果(输出截图) 满分2分",
-                label_visibility="collapsed",
-            )
-            if res_score is not None and res_score != current_res:
-                st.session_state.scores[sub_file][score_key_res] = res_score
-                save_scores()
+            render_scoring_checkboxes(sub_file, q_idx, s_idx, "结果", rubric_data)
 
         # Sub-total for this sub-question (only when both scored)
         prog_val = scores.get(skey(q_idx, s_idx, "程序"))
@@ -633,6 +993,15 @@ def main():
             background: #dbeafe !important;
             border-color: #3b82f6 !important;
             font-weight: 700;
+        }
+        /* Compact checkboxes in scoring column */
+        div[data-testid="stCheckbox"] label {
+            font-size: 0.82rem !important;
+            padding: 0.15rem 0 !important;
+            gap: 0.3rem !important;
+        }
+        div[data-testid="stCheckbox"] {
+            min-height: 1.6rem !important;
         }
         /* Score label styling */
         .score-label {
@@ -692,9 +1061,10 @@ def main():
             st.markdown("""
             ### 使用说明
             1. 上传 **参考答案 .docx** 文档
-            2. 上传 **学生答卷 .docx** 文件（可多选）
-            3. 在左侧选择学生，逐题批改
-            4. 点击 **导出成绩** 生成 xlsx 文件
+            2. 上传 **评分标准 .json** 文件
+            3. 上传 **学生答卷 .docx** 文件（可多选）
+            4. 勾选评分标准中的得分点进行批改
+            5. 点击 **导出成绩** 生成 xlsx 文件
             """)
             return
 
