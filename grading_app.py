@@ -24,6 +24,7 @@ from docx_parser import (
     parse_student_docx,
     question_signature,
 )
+from ipynb_parser import parse_reference_ipynb
 from scoring import SCORE_CONFIG, export_to_xlsx
 
 # ---------------------------------------------------------------------------
@@ -640,27 +641,30 @@ with st.sidebar:
     # ---- Combined reference / rubric uploader ----
     st.subheader("📄 参考答案 / 📋 评分标准")
     ref_rubric_files = st.file_uploader(
-        "上传 .docx (参考答案) 或 .json (评分标准)",
-        type=["docx", "json"],
+        "上传 .docx/.ipynb (参考答案) 或 .json (评分标准)",
+        type=["docx", "ipynb", "json"],
         accept_multiple_files=True,
         key="ref_rubric_uploader",
-        help="上传参考答案文档(.docx)和/或评分标准文件(.json)，根据文件扩展名自动识别",
+        help="上传参考答案文档(.docx/.ipynb)和/或评分标准文件(.json)，根据文件扩展名自动识别",
     )
 
     # Determine what file types are currently uploaded
     current_docx = None
+    current_ipynb = None
     current_json = None
     if ref_rubric_files:
         for f in ref_rubric_files:
             if f.name.lower().endswith(".docx"):
                 current_docx = f
+            elif f.name.lower().endswith(".ipynb"):
+                current_ipynb = f
             elif f.name.lower().endswith(".json"):
                 current_json = f
 
-    # --- Process reference docx (filename-based comparison — avoids UploadedFile identity issues on rerun) ---
+    # --- Process reference docx (filename-based comparison) ---
     if current_docx is not None:
         if st.session_state.reference_filename != current_docx.name:
-            with st.spinner("正在解析参考答案..."):
+            with st.spinner("正在解析参考答案 (.docx)..."):
                 try:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
                         tmp.write(current_docx.getbuffer())
@@ -676,9 +680,29 @@ with st.sidebar:
                     load_scores()
                 except Exception as e:
                     st.error(f"参考答案解析失败: {e}")
-                    # Don't clear old state on re-parse failure — keep previous data
     else:
-        # DON'T auto-clear — prevents data loss when uploader returns empty on transient rerun
+        pass
+
+    # --- Process reference ipynb ---
+    if current_ipynb is not None:
+        if st.session_state.reference_filename != current_ipynb.name:
+            with st.spinner("正在解析参考答案 (.ipynb)..."):
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".ipynb") as tmp:
+                        tmp.write(current_ipynb.getbuffer())
+                        tmp_path = tmp.name
+                    st.session_state.reference_questions = parse_reference_ipynb(tmp_path)
+                    st.session_state.reference_signature = question_signature(
+                        st.session_state.reference_questions
+                    )
+                    st.session_state.reference_docx = current_ipynb
+                    st.session_state.reference_filename = current_ipynb.name
+                    os.unlink(tmp_path)
+                    st.success(f"已加载参考答案: {current_ipynb.name}")
+                    load_scores()
+                except Exception as e:
+                    st.error(f"参考答案解析失败: {e}")
+    else:
         pass
 
     # --- Process rubric json (filename-based comparison) ---
@@ -703,11 +727,12 @@ with st.sidebar:
     # Show status of what's loaded
     if st.session_state.reference_questions:
         qs = st.session_state.reference_questions
-        st.info(f"✅ 参考答案: {st.session_state.reference_filename} ({len(qs)} 大题)")
-    elif current_docx is not None:
-        st.warning("请上传参考答案 (.docx) — 正在处理...")
+        ref_type = "📓" if st.session_state.reference_filename.endswith(".ipynb") else "📄"
+        st.info(f"{ref_type} 参考答案: {st.session_state.reference_filename} ({len(qs)} 大题)")
+    elif current_docx is not None or current_ipynb is not None:
+        st.warning("请上传参考答案 — 正在处理...")
     elif st.session_state.reference_filename is None:
-        st.warning("请上传参考答案 (.docx)")
+        st.warning("请上传参考答案 (.docx / .ipynb)")
 
     if st.session_state.scoring_rubric:
         section_count = len(st.session_state.scoring_rubric.get("sections", []))
@@ -901,8 +926,13 @@ def render_sub_question(
         col1, col2, col3 = st.columns([4, 4, 2])
         with col1:
             st.caption("📖 参考答案 — 程序")
-            if ref_sub and ref_sub.program and ref_sub.program.image_bytes:
-                st.image(ref_sub.program.image_bytes, width='stretch')
+            if ref_sub and ref_sub.program:
+                if ref_sub.program.text_content:
+                    st.code(ref_sub.program.text_content, language="python", line_numbers=True)
+                elif ref_sub.program.image_bytes:
+                    st.image(ref_sub.program.image_bytes, width='stretch')
+                elif ref_sub.program.is_missing:
+                    st.info("无参考数据")
             else:
                 st.info("无参考数据")
 
@@ -926,8 +956,13 @@ def render_sub_question(
         col1, col2, col3 = st.columns([4, 4, 2])
         with col1:
             st.caption("📖 参考答案 — 结果")
-            if ref_sub and ref_sub.result and ref_sub.result.image_bytes:
-                st.image(ref_sub.result.image_bytes, width='stretch')
+            if ref_sub and ref_sub.result:
+                if ref_sub.result.image_bytes:
+                    st.image(ref_sub.result.image_bytes, width='stretch')
+                elif ref_sub.result.text_content:
+                    st.code(ref_sub.result.text_content, language="text")
+                elif ref_sub.result.is_missing:
+                    st.info("无参考数据")
             else:
                 st.info("无参考数据")
 
@@ -1060,7 +1095,7 @@ def main():
             st.info("👈 请先在左侧上传参考答案和学生答卷文件")
             st.markdown("""
             ### 使用说明
-            1. 上传 **参考答案 .docx** 文档
+            1. 上传 **参考答案**（.docx 或 .ipynb 格式）
             2. 上传 **评分标准 .json** 文件
             3. 上传 **学生答卷 .docx** 文件（可多选）
             4. 勾选评分标准中的得分点进行批改
