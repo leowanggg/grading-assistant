@@ -743,9 +743,9 @@ with st.sidebar:
     elif st.session_state.scoring_rubric_filename is None:
         st.warning("请上传评分标准 (.json)")
 
-    # Clear button for loaded reference/rubric
+    # Reload button — clears reference/rubric + wipes checkmarks for a fresh start
     if st.session_state.reference_questions or st.session_state.scoring_rubric:
-        if st.button("🗑️ 清除已加载的文件", use_container_width=True, key="clear_ref_rubric"):
+        if st.button("🔄 重新加载", use_container_width=True, key="clear_ref_rubric"):
             st.session_state.reference_docx = None
             st.session_state.reference_questions = None
             st.session_state.reference_signature = None
@@ -753,6 +753,8 @@ with st.sidebar:
             st.session_state.scoring_rubric = None
             st.session_state.scoring_rubric_file = None
             st.session_state.scoring_rubric_filename = None
+            # Clear checkmarks since they are only valid for the previous rubric
+            st.session_state.checkmarks = {}
             st.rerun()
 
 
