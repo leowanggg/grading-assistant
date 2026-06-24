@@ -7,7 +7,6 @@ Usage:
 
 from __future__ import annotations
 
-import base64
 import datetime
 import json
 import os
@@ -792,19 +791,31 @@ with st.sidebar:
 # Clickable image helper
 # ---------------------------------------------------------------------------
 
-def _render_zoomable_image(image_bytes: bytes, alt: str = "学生答案"):
-    """Render an image that opens full-size in a new browser tab when clicked."""
-    b64 = base64.b64encode(image_bytes).decode()
-    st.markdown(
-        f'<a href="data:image/png;base64,{b64}" target="_blank" '
-        f'title="点击放大">'
-        f'<img src="data:image/png;base64,{b64}" '
-        f'alt="{alt}" '
-        f'style="max-width:100%;cursor:zoom-in;border:1px solid #e2e8f0;border-radius:6px;">'
-        f'</a>',
-        unsafe_allow_html=True,
-    )
-    st.caption("💡 点击图片可在新标签页中放大查看")
+@st.dialog("🔍 放大查看", width="large")
+def _show_zoomed_image():
+    """Modal dialog that shows a full-size version of the zoomed image."""
+    img = st.session_state.get("_zoom_image")
+    label = st.session_state.get("_zoom_label", "")
+    if label:
+        st.caption(label)
+    if img:
+        st.image(img, use_container_width=True)
+
+
+def _render_zoomable_image(
+    image_bytes: bytes,
+    sub_file: str,
+    q_idx: int,
+    s_idx: int,
+    section: str,
+):
+    """Render a student answer image that can be clicked to zoom in a dialog."""
+    st.image(image_bytes, use_container_width=True)
+    zoom_key = f"zoom-{sub_file}-{q_idx}-{s_idx}-{section}"
+    if st.button("🔍 放大", key=zoom_key):
+        st.session_state["_zoom_image"] = image_bytes
+        st.session_state["_zoom_label"] = f"Q{q_idx}({s_idx}) {section}"
+        _show_zoomed_image()
 
 
 # ---------------------------------------------------------------------------
@@ -990,7 +1001,7 @@ def render_sub_question(
         with col2:
             st.caption("📸 学生答案 — 程序")
             if stu_sub and stu_sub.program and stu_sub.program.image_bytes:
-                _render_zoomable_image(stu_sub.program.image_bytes, "程序答案")
+                _render_zoomable_image(stu_sub.program.image_bytes, sub_file, q_idx, s_idx, "程序")
             else:
                 st.error("❌ 未作答")
 
@@ -1014,7 +1025,7 @@ def render_sub_question(
         with col2:
             st.caption("📸 学生答案 — 结果")
             if stu_sub and stu_sub.result and stu_sub.result.image_bytes:
-                _render_zoomable_image(stu_sub.result.image_bytes, "结果答案")
+                _render_zoomable_image(stu_sub.result.image_bytes, sub_file, q_idx, s_idx, "结果")
             else:
                 st.error("❌ 未作答")
 
