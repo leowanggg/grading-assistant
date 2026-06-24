@@ -7,6 +7,7 @@ Usage:
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import os
@@ -564,6 +565,34 @@ with st.sidebar:
             st.progress(graded_stu / total_stu,
                         text=f"第{'一二三四'[q_idx]}题 — {graded_stu}/{total_stu} 人已完成")
 
+            # Auto-advance to next question when all students are done for this one
+            question_labels = "一二三四"
+            if graded_stu == total_stu and total_stu > 0:
+                if q_idx < 3:  # not the last question
+                    st.session_state._auto_advance = f"🎉 第{question_labels[q_idx]}题全部批改完成，已自动切换到第{question_labels[q_idx+1]}题"
+                    st.session_state.current_tab = q_idx + 1
+                    st.session_state.current_student = student_names[0]
+                    st.rerun()
+                else:
+                    # Check if ALL four questions are fully graded
+                    all_done = True
+                    for qi in range(4):
+                        done = sum(
+                            1 for fname in student_names
+                            if all(
+                                st.session_state.scores.get(fname, {}).get(skey(qi + 1, s, "程序")) is not None
+                                and st.session_state.scores.get(fname, {}).get(skey(qi + 1, s, "结果")) is not None
+                                for s in range(1, 6)
+                            )
+                        )
+                        if done < total_stu:
+                            all_done = False
+                            break
+                    if all_done and not st.session_state.get("_all_done_shown"):
+                        st.session_state._all_done_shown = True
+                        st.balloons()
+                        st.success("🎉🎉🎉 全部四道大题批改完成！可以导出成绩了 🎉🎉🎉")
+
         # ---- Export ----
         st.divider()
         if st.button("📊 导出成绩 (.xlsx)", use_container_width=True, type="primary"):
@@ -755,7 +784,27 @@ with st.sidebar:
             st.session_state.scoring_rubric_filename = None
             # Clear checkmarks since they are only valid for the previous rubric
             st.session_state.checkmarks = {}
+            st.session_state._all_done_shown = False
             st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Clickable image helper
+# ---------------------------------------------------------------------------
+
+def _render_zoomable_image(image_bytes: bytes, alt: str = "学生答案"):
+    """Render an image that opens full-size in a new browser tab when clicked."""
+    b64 = base64.b64encode(image_bytes).decode()
+    st.markdown(
+        f'<a href="data:image/png;base64,{b64}" target="_blank" '
+        f'title="点击放大">'
+        f'<img src="data:image/png;base64,{b64}" '
+        f'alt="{alt}" '
+        f'style="max-width:100%;cursor:zoom-in;border:1px solid #e2e8f0;border-radius:6px;">'
+        f'</a>',
+        unsafe_allow_html=True,
+    )
+    st.caption("💡 点击图片可在新标签页中放大查看")
 
 
 # ---------------------------------------------------------------------------
@@ -941,7 +990,7 @@ def render_sub_question(
         with col2:
             st.caption("📸 学生答案 — 程序")
             if stu_sub and stu_sub.program and stu_sub.program.image_bytes:
-                st.image(stu_sub.program.image_bytes, width='stretch')
+                _render_zoomable_image(stu_sub.program.image_bytes, "程序答案")
             else:
                 st.error("❌ 未作答")
 
@@ -965,7 +1014,7 @@ def render_sub_question(
         with col2:
             st.caption("📸 学生答案 — 结果")
             if stu_sub and stu_sub.result and stu_sub.result.image_bytes:
-                st.image(stu_sub.result.image_bytes, width='stretch')
+                _render_zoomable_image(stu_sub.result.image_bytes, "结果答案")
             else:
                 st.error("❌ 未作答")
 
@@ -1092,6 +1141,12 @@ def main():
             5. 点击 **导出成绩** 生成 xlsx 文件
             """)
             return
+
+    # Show auto-advance notification (persists across rerun)
+    auto_msg = st.session_state.get("_auto_advance")
+    if auto_msg:
+        st.success(auto_msg)
+        del st.session_state["_auto_advance"]
 
     render_student_answer(current, ref_qs)
 
