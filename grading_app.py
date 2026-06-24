@@ -7,6 +7,7 @@ Usage:
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import os
@@ -791,17 +792,6 @@ with st.sidebar:
 # Clickable image helper
 # ---------------------------------------------------------------------------
 
-@st.dialog("🔍 放大查看", width="large")
-def _show_zoomed_image():
-    """Modal dialog that shows a full-size version of the zoomed image."""
-    img = st.session_state.get("_zoom_image")
-    label = st.session_state.get("_zoom_label", "")
-    if label:
-        st.caption(label)
-    if img:
-        st.image(img, use_container_width=True)
-
-
 def _render_zoomable_image(
     image_bytes: bytes,
     sub_file: str,
@@ -809,13 +799,55 @@ def _render_zoomable_image(
     s_idx: int,
     section: str,
 ):
-    """Render a student answer image that can be clicked to zoom in a dialog."""
-    st.image(image_bytes, use_container_width=True)
-    zoom_key = f"zoom-{sub_file}-{q_idx}-{s_idx}-{section}"
-    if st.button("🔍 放大", key=zoom_key):
-        st.session_state["_zoom_image"] = image_bytes
-        st.session_state["_zoom_label"] = f"Q{q_idx}({s_idx}) {section}"
-        _show_zoomed_image()
+    """Render a student answer image that zooms in a full-screen overlay on click.
+
+    Uses a pure-CSS :target lightbox — click the image to zoom, click the
+    dark backdrop (or press Esc) to close.
+    """
+    import hashlib
+
+    b64 = base64.b64encode(image_bytes).decode()
+    # Unique but stable ID so the :target hash doesn't collide across renders
+    uid = hashlib.md5(f"{sub_file}-{q_idx}-{s_idx}-{section}".encode()).hexdigest()[:8]
+    zoom_id = f"zoom-{uid}"
+
+    st.markdown(
+        f"""<style>
+#{zoom_id} {{
+    display: none;
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.88); z-index: 99999;
+    cursor: zoom-out;
+}}
+#{zoom_id}:target {{
+    display: flex; align-items: center; justify-content: center;
+}}
+#{zoom_id} img {{
+    max-width: 95vw; max-height: 95vh;
+    border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,.5);
+    cursor: default;
+}}
+#{zoom_id} .close-btn {{
+    position: absolute; top: 18px; right: 28px;
+    color: #fff; font-size: 36px; line-height: 1;
+    text-decoration: none; cursor: pointer;
+    font-weight: 300; opacity: 0.8;
+}}
+#{zoom_id} .close-btn:hover {{ opacity: 1; }}
+</style>
+
+<a href="#{zoom_id}" title="点击放大" style="display:inline-block;line-height:0;">
+  <img src="data:image/png;base64,{b64}"
+       style="max-width:100%;cursor:zoom-in;border:1px solid #e2e8f0;border-radius:6px;"
+       alt="Q{q_idx}({s_idx}) {section}">
+</a>
+
+<div id="{zoom_id}">
+  <a href="#" class="close-btn">&times;</a>
+  <img src="data:image/png;base64,{b64}" alt="Q{q_idx}({s_idx}) {section}">
+</div>""",
+        unsafe_allow_html=True,
+    )
 
 
 # ---------------------------------------------------------------------------
