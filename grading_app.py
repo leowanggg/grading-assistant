@@ -940,14 +940,8 @@ def render_sub_question(
 
         with col2:
             st.caption("📸 学生答案 — 程序")
-            if stu_sub and stu_sub.program:
-                if stu_sub.program.image_bytes:
-                    st.image(stu_sub.program.image_bytes, width='stretch')
-                elif stu_sub.program.text_content:
-                    st.text_area("文字答案", stu_sub.program.text_content, height=100, disabled=True,
-                                key=f"{sub_file}-{q_idx}-{s_idx}-prog-text")
-                else:
-                    st.error("❌ 未作答")
+            if stu_sub and stu_sub.program and stu_sub.program.image_bytes:
+                st.image(stu_sub.program.image_bytes, width='stretch')
             else:
                 st.error("❌ 未作答")
 
@@ -970,14 +964,8 @@ def render_sub_question(
 
         with col2:
             st.caption("📸 学生答案 — 结果")
-            if stu_sub and stu_sub.result:
-                if stu_sub.result.image_bytes:
-                    st.image(stu_sub.result.image_bytes, width='stretch')
-                elif stu_sub.result.text_content:
-                    st.text_area("文字答案", stu_sub.result.text_content, height=100, disabled=True,
-                                key=f"{sub_file}-{q_idx}-{s_idx}-res-text")
-                else:
-                    st.error("❌ 未作答")
+            if stu_sub and stu_sub.result and stu_sub.result.image_bytes:
+                st.image(stu_sub.result.image_bytes, width='stretch')
             else:
                 st.error("❌ 未作答")
 

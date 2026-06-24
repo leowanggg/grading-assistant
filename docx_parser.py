@@ -75,12 +75,183 @@ W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 A_NS  = "http://schemas.openxmlformats.org/drawingml/2006/main"
 R_NS  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+VML_NS = "urn:schemas-microsoft-com:vml"
+O_NS   = "urn:schemas-microsoft-com:office:office"
 
 WP_INLINE   = f"{{{WP_NS}}}inline"
 WP_ANCHOR   = f"{{{WP_NS}}}anchor"
 A_BLIP      = f"{{{A_NS}}}blip"
 R_EMBED     = f"{{{R_NS}}}embed"
+R_ID        = f"{{{R_NS}}}id"
 W_DRAWING   = f"{{{W_NS}}}drawing"
+V_IMAGEDATA = f"{{{VML_NS}}}imagedata"
+V_RECT      = f"{{{VML_NS}}}rect"
+V_SHAPE     = f"{{{VML_NS}}}shape"
+O_OLEOBJECT = f"{{{O_NS}}}OLEObject"
+
+
+# ---------------------------------------------------------------------------
+# WMF metafile → PNG conversion (Windows GDI)
+# ---------------------------------------------------------------------------
+
+def _wmf_to_png_via_gdi(wmf_data: bytes) -> Optional[bytes]:
+    """Convert WMF/EMF metafile bytes to PNG using Windows GDI.
+
+    Returns PNG bytes on success, None on failure.
+    Only works on Windows (uses ctypes + gdi32.dll).
+    """
+    import ctypes
+    from ctypes import wintypes, byref, sizeof, c_void_p, c_char_p
+
+    if len(wmf_data) < 8:
+        return None
+
+    gdi32 = ctypes.windll.gdi32
+    user32 = ctypes.windll.user32
+
+    # Set up proper argument and return types (critical for 64-bit handles)
+    gdi32.SetWinMetaFileBits.restype = wintypes.HANDLE
+    gdi32.SetWinMetaFileBits.argtypes = [wintypes.UINT, c_char_p, wintypes.HDC, c_void_p]
+    gdi32.PlayEnhMetaFile.restype = wintypes.BOOL
+    gdi32.PlayEnhMetaFile.argtypes = [wintypes.HDC, wintypes.HANDLE, ctypes.POINTER(wintypes.RECT)]
+    gdi32.DeleteEnhMetaFile.restype = wintypes.BOOL
+    gdi32.DeleteEnhMetaFile.argtypes = [wintypes.HANDLE]
+    gdi32.GetEnhMetaFileBits.restype = wintypes.UINT
+    gdi32.GetEnhMetaFileBits.argtypes = [wintypes.HANDLE, wintypes.UINT, c_void_p]
+
+    hdc_ref = user32.GetDC(0)
+    if not hdc_ref:
+        return None
+
+    hemf = None
+    hbmp = None
+    hdc_mem = None
+    w_px = h_px = 0
+
+    try:
+        # Convert WMF to Enhanced Metafile
+        n_size = len(wmf_data)
+        buf = ctypes.create_string_buffer(wmf_data, n_size)
+        hemf = gdi32.SetWinMetaFileBits(n_size, buf, hdc_ref, None)
+        if not hemf:
+            return None
+
+        # Get EMF header to determine bounding rectangle
+        emf_size = gdi32.GetEnhMetaFileBits(hemf, 0, None)
+        if emf_size > 0:
+            emf_buf = ctypes.create_string_buffer(emf_size)
+            written = gdi32.GetEnhMetaFileBits(hemf, emf_size, emf_buf)
+            if written > 0:
+                # Parse ENHMETAHEADER: iType(4) nSize(4) rclBounds(16) ...
+                import struct
+                left, top, right, bottom = struct.unpack_from('iiii', emf_buf.raw, 8)
+                w_dev = max(right - left, 1)
+                h_dev = max(bottom - top, 1)
+                # Convert 0.01mm device units to pixels (~96 DPI)
+                w_px = int(w_dev / 26.46 + 0.5)
+                h_px = int(h_dev / 26.46 + 0.5)
+
+        # Ensure reasonable minimum dimensions (typical code screenshots)
+        if emf_size == 0 or w_px < 400 or h_px < 300:
+            w_px, h_px = 1600, 1000
+
+        # Create memory DC & bitmap
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_ref)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_ref, w_px, h_px)
+        gdi32.SelectObject(hdc_mem, hbmp)
+
+        # White background (FillRect is in user32.dll)
+        brush = gdi32.CreateSolidBrush(0x00FFFFFF)
+        rect = wintypes.RECT(0, 0, w_px, h_px)
+        user32.FillRect(hdc_mem, byref(rect), brush)
+        gdi32.DeleteObject(brush)
+
+        # Render EMF into the DC
+        emf_rect = wintypes.RECT(0, 0, w_px, h_px)
+        if not gdi32.PlayEnhMetaFile(hdc_mem, hemf, byref(emf_rect)):
+            return None
+
+        # Extract pixel data via GetDIBits
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ('biSize', wintypes.DWORD),
+                ('biWidth', wintypes.LONG),
+                ('biHeight', wintypes.LONG),
+                ('biPlanes', wintypes.WORD),
+                ('biBitCount', wintypes.WORD),
+                ('biCompression', wintypes.DWORD),
+                ('biSizeImage', wintypes.DWORD),
+                ('biXPelsPerMeter', wintypes.LONG),
+                ('biYPelsPerMeter', wintypes.LONG),
+                ('biClrUsed', wintypes.DWORD),
+                ('biClrImportant', wintypes.DWORD),
+            ]
+
+        class BITMAPINFO(ctypes.Structure):
+            _fields_ = [('bmiHeader', BITMAPINFOHEADER)]
+
+        bi = BITMAPINFO()
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = w_px
+        bi.bmiHeader.biHeight = -h_px  # negative = top-down DIB
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0  # BI_RGB
+
+        row_size = ((w_px * 32 + 31) // 32) * 4
+        pixels = ctypes.create_string_buffer(row_size * h_px)
+        copied = gdi32.GetDIBits(
+            hdc_mem, hbmp, 0, h_px, pixels, byref(bi), 0  # 0 = DIB_RGB_COLORS
+        )
+        if copied == 0:
+            return None
+
+        # Build PIL Image from BGRA raw data → PNG
+        # GetDIBits returns BGRA with alpha byte undefined (typically 0).
+        # Fix alpha to 255 so the image is fully opaque.
+        pixels_ba = bytearray(pixels.raw)
+        pixels_ba[3::4] = b'\xff' * (len(pixels_ba) // 4)
+        from PIL import Image as PILImage
+        img = PILImage.frombuffer('RGBA', (w_px, h_px), bytes(pixels_ba), 'raw', 'BGRA', row_size, 1)
+        png_buf = io.BytesIO()
+        img.save(png_buf, 'PNG')
+        return png_buf.getvalue()
+
+    except Exception:
+        return None
+    finally:
+        if hemf:
+            gdi32.DeleteEnhMetaFile(hemf)
+        if hbmp:
+            gdi32.DeleteObject(hbmp)
+        if hdc_mem:
+            gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(0, hdc_ref)
+
+
+def _is_wmf(data: bytes) -> bool:
+    """Check if byte data looks like a WMF/EMF metafile."""
+    if len(data) < 4:
+        return False
+    # Aldus Placeable WMF header
+    if data[:4] == b'\xd7\xcd\xc6\x9a':
+        return True
+    # Standard WMF META_HEADER (type=1 memory, type=2 disk)
+    if data[:2] in (b'\x01\x00', b'\x02\x00'):
+        return True
+    # EMF header
+    if data[:4] == b'\x01\x00\x00\x00':
+        return True
+    return False
+
+
+def _ensure_renderable(data: bytes) -> bytes:
+    """If data is a WMF/EMF metafile, convert to PNG; otherwise return as-is."""
+    if _is_wmf(data):
+        png = _wmf_to_png_via_gdi(data)
+        if png is not None:
+            return png
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -88,43 +259,61 @@ W_DRAWING   = f"{{{W_NS}}}drawing"
 # ---------------------------------------------------------------------------
 
 def get_image_bytes(para, document: Document) -> Optional[bytes]:
-    """Extract the first inline or floating image from a paragraph, return raw bytes."""
+    """Extract the first image from a paragraph, return raw bytes.
+
+    Supports three embedding formats:
+    1. Standard inline/floating images via w:drawing > wp:inline > a:blip
+    2. VML-based images via v:imagedata (legacy Word format, e.g. WMF metafiles)
+    """
     element = para._element
 
-    # Search for wp:inline > a:blip
+    # ---- Approach 1: Standard DrawingML inline/floating images ----
     container = element.find(f".//{WP_INLINE}")
-    # Fallback: search for wp:anchor > a:blip (floating images)
     if container is None:
         container = element.find(f".//{WP_ANCHOR}")
-    # Fallback: search for w:drawing > wp:inline
     if container is None:
         drawing = element.find(f".//{W_DRAWING}")
         if drawing is not None:
             container = drawing.find(f".//{WP_INLINE}")
-    if container is None:
-        return None
+    if container is not None:
+        blip = container.find(f".//{A_BLIP}")
+        if blip is not None:
+            r_id = blip.get(R_EMBED)
+            if r_id is not None:
+                try:
+                    rel = document.part.rels[r_id]
+                    return _ensure_renderable(rel.target_part.blob)
+                except (KeyError, AttributeError):
+                    pass
 
-    blip = container.find(f".//{A_BLIP}")
-    if blip is None:
-        return None
+    # ---- Approach 2: VML imagedata (legacy WMF/EMF metafile images) ----
+    # Look inside v:rect, v:shape, or directly for v:imagedata
+    vml_data = element.find(f".//{V_IMAGEDATA}")
+    if vml_data is not None:
+        # Try r:id (namespaced) first, then bare "id"
+        r_id = vml_data.get(R_ID)
+        if r_id is not None:
+            try:
+                rel = document.part.rels[r_id]
+                blob = rel.target_part.blob
+                # WMF metafiles need conversion to PNG for PIL/Streamlit
+                return _ensure_renderable(blob)
+            except (KeyError, AttributeError):
+                pass
 
-    r_id = blip.get(R_EMBED)
-    if r_id is None:
-        return None
-
-    try:
-        rel = document.part.rels[r_id]
-        return rel.target_part.blob
-    except (KeyError, AttributeError):
-        return None
+    return None
 
 
 def has_image(para) -> bool:
-    """Quick check if a paragraph contains an inline image."""
+    """Quick check if a paragraph contains an image (DrawingML or VML)."""
     element = para._element
     if element.find(f".//{WP_INLINE}") is not None:
         return True
-    return element.find(f".//{W_DRAWING}") is not None
+    if element.find(f".//{W_DRAWING}") is not None:
+        return True
+    if element.find(f".//{V_IMAGEDATA}") is not None:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -386,12 +575,33 @@ def parse_questions(doc: Document, has_cn_major: bool = False) -> List[MajorQues
 
         # ---------- CAPTURE_IMAGE ----------
         if state == "CAPTURE_IMAGE":
-            # If a section label appears while waiting for image, update pending section
+            # When a section label appears, first check if THIS paragraph
+            # already contains an image (common — image in same para as "结果：")
+            img_bytes = get_image_bytes(para, doc)
+
             if _PROG_RE.match(text):
-                pending_section = "程序"
+                # Close previous pending section if switching
+                if pending_section == "结果" and cur_sub is not None:
+                    cur_sub.result = ImageSection(section_type="结果", is_missing=True)
+                if img_bytes is not None:
+                    if cur_sub is not None:
+                        cur_sub.program = ImageSection(section_type="程序", image_bytes=img_bytes)
+                    state = "IN_SUB"
+                    pending_section = None
+                else:
+                    pending_section = "程序"
                 continue
             if _RESULT_RE.match(text):
-                pending_section = "结果"
+                # Close previous pending section if switching
+                if pending_section == "程序" and cur_sub is not None:
+                    cur_sub.program = ImageSection(section_type="程序", is_missing=True)
+                if img_bytes is not None:
+                    if cur_sub is not None:
+                        cur_sub.result = ImageSection(section_type="结果", image_bytes=img_bytes)
+                    state = "IN_SUB"
+                    pending_section = None
+                else:
+                    pending_section = "结果"
                 continue
 
             # Check if a new section/sub-question starts before we captured anything
@@ -411,6 +621,9 @@ def parse_questions(doc: Document, has_cn_major: bool = False) -> List[MajorQues
                     new_sub = False      # Format B: skip detail marker in capture state
                 else:
                     new_sub = True       # Format A: "(N)" → new sub-Q
+            # Also check for Chinese-numeral major-question header
+            if not new_sub and not new_major and _MAJOR_RE.search(text):
+                new_major = True
 
             if new_sub or new_major:
                 # Mark current section as missing, close it
